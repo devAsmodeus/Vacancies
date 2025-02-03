@@ -15,18 +15,18 @@ VERSION = '24.29.3.3'
 
 async def main() -> None:
     while True:
-        menu = await format_details()
+        menu, sort_type = await format_details()
         for country, region, city_id, city_name, role_id, role_name in set(menu):
             file_vacancies, new_vacancies = await get_file_vacancies(), set()
             print(f'На данный момент в хранилище {len(file_vacancies)} вакансий')
             try:
                 for page in count(start=0, step=1):
-                    print(f'Парсим вакансии: {country} / {region} / {city_name} / {role_name}. Страница {page + 1}')
-                    page_vacancies = await parse_region_page(city_id, role_id, page)
+                    print(f'Выгружаем вакансии: {country} / {region} / {city_name} / {role_name}. Страница {page + 1}')
+                    page_vacancies = await parse_region_page(city_id, role_id, page, sort_type)
                     new_vacancies, data = await send_vacancies(
-                        vacancies=dict.get(page_vacancies, 'vacancies'),
+                        vacancies=page_vacancies.get('vacancies'),
                         file_vacancies=file_vacancies,
-                        new_vacancies=new_vacancies
+                        new_vacancies=new_vacancies,
                     )
                     await asyncio.sleep(2)
                     if paging := dict.get(page_vacancies, 'paging', dict()):
@@ -41,38 +41,42 @@ async def main() -> None:
                 await asyncio.sleep(120)
 
 
-async def format_details() -> list[tuple]:
-    async with ClientSession(headers=await get_headers(index=1), connector=TCPConnector(ssl=False)) as session:
-        menu, urls = await parse_menu(session), list()
-        menu = json.loads(menu.find(id='HH-Lux-InitialState').text)
-        area, industries, roles = menu['areaTree'], menu['industriesTree'], menu['professionalRoleTree']
-        for country in area:
-            country_name = dict.get(country, 'text')
-            if country_name == 'Россия':
-                for region in dict.get(country, 'items', dict()):
-                    region_id, region_name = dict.get(region, 'id'), dict.get(region, 'text')
-                    for city in dict.get(region, 'items', dict()):
-                        city_id, city_name = dict.get(city, 'id'), dict.get(city, 'text')
-                        urls.extend(await format_roles(roles, country_name, region_name, city_id, city_name))
+async def format_details() -> tuple[list[tuple], str]:
+    headers, connector = get_headers(index=1), TCPConnector(ssl=False)
+    result, (sort_type, settings_areas, settings_roles) = list(), format_setting()
+    async with ClientSession(headers=headers, connector=connector) as session:
+        menu: BeautifulSoup = await parse_menu(session)
+        menu: dict = json.loads(menu.find(id='HH-Lux-InitialState').text)
+        areas, roles = menu.get('areaTree', list()), menu.get('professionalRoleTree', dict())
+        for country in areas:
+            if (country_name := country.get('text')) == 'Россия':
+                for area in country.get('items', dict()):
+                    area_id, area_name = area.get('id'), area.get('text')
+                    for city in area.get('items', dict()):
+                        city_id, city_name = city.get('id'), city.get('text')
+                        parameters = country_name, area_name, city_id, city_name
+                        result.extend(format_roles(roles, settings_areas, settings_roles, parameters))
                     else:
-                        urls.extend(await format_roles(roles, country_name, region_name, region_id, region_name))
+                        parameters = country_name, area_name, area_id, area_name
+                        result.extend(format_roles(roles, settings_areas, settings_roles, parameters))
         else:
-            return urls
+            return result, sort_type
 
 
-async def format_roles(roles, country, region, city_id, city_name):
-    urls = list()
-    for part_roles in dict.get(roles, 'items', dict()):
-        for role in dict.get(part_roles, 'items', dict()):
-            role_id, role_name = dict.get(role, 'id'), dict.get(role, 'text')
-            urls.append((country, region, city_id, city_name, role_id, role_name))
+def format_roles(roles: dict, settings_areas: list[str], settings_roles: list[str], *args) -> list[tuple]:
+    result, (country_name, region, area_id, area_name) = list(), *args
+    for part_roles in roles.get('items', dict()):
+        for role in part_roles.get('items', dict()):
+            role_id, role_name = role.get('id'), role.get('text')
+            if role_id in settings_roles and area_id in settings_areas:
+                result.append((country_name, region, area_id, area_name, role_id, role_name))
     else:
-        return urls
+        return result
 
 
 async def send_vacancies(vacancies: list[dict], file_vacancies: set, new_vacancies: set) -> tuple[set, list[str]]:
     data = list()
-    async with ClientSession(headers=await get_headers(index=3), connector=TCPConnector(ssl=False)) as session:
+    async with ClientSession(headers=get_headers(index=3), connector=TCPConnector(ssl=False)) as session:
         for vacancy in tqdm(vacancies, desc='Отправка вакансий по запросу'):
             vacancy_id = dict.get(vacancy, 'vacancyId')
             if vacancy_id not in file_vacancies and vacancy_id not in new_vacancies and '@isAdv' not in vacancy:
@@ -127,51 +131,74 @@ async def format_vacancy(vacancy: dict, contacts: dict, index: int) -> tuple[str
         }
 
 
-async def get_headers(index: int) -> dict:
+def get_headers(index: int) -> dict:
     if index == 1:
         return {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br, zstd',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Cache-Control': 'no-cache',
-            'Cookie': 'hhuid=ogfiDIr3fZ9ztGaG9qYxQw--; _ym_uid=1720120998292002741; hhul=0c5a85594ce8b83931d9a664f0a63daa3131d8f2b9245a5a3d4fdd9865770d79; __ddg9_=46.53.254.169; __ddg1_=PBB8Ku4OGTb11nOSn9vU; _xsrf=b03ddeac4e6dc4f6323837eea50619ef; regions=1; region_clarified=NOT_SET; display=desktop; crypted_hhuid=24E9B4391513F61BC00B67F16B210B6407489A407DBA93F151E2EABEE0CF1BE1; GMT=3; tmr_lvid=1d4be8f47da74bb07c5394c3bf12e3be; tmr_lvidTS=1720120998391; _ym_d=1738009083; iap.uid=1cf6bdc1c46f452f8f04401f44134381; _ym_isad=2; _ym_visorc=w; domain_sid=1tIAOBVsSp5njm1l1ThII%3A1738009083999; uxs_uid=2e086ef0-3a3f-11ef-9fbb-99bb2b974093; crypted_id=E0154C375A09DD4F48A21CB2DE4073ABA5471C6F722104504734B32F0D03E9F8; hhtoken=OhVNryfiPApol9anLxkH3v6GAUe8; _hi=153726015; hhrole=applicant; __zzatgib-w-hh=MDA0dC0jViV+FmELHw4/aQsbSl1pCENQGC9LXy8sPCAdZHlgUnkPVn9WS0V3JVRTPA9jbklteFtBaiBoOVURCxIXRF5cVWl1FRpLSiVueCplJS0xViR8SylEXFAJJRkaeG4nTw0RVy8NPjteLW8PKhMjZHYhP04hC00+KlwVNk0mbjN3RhsJHlksfEspNVZ/elpMGn5yWQsPDRVDc3R3LEBtIV9PXlNEE34KJxkReyVXVQoOYEAzaWVpcC9gIBIlEU1HGEVkW0I2KBVLcU8cenZffSpCaCVfR2IgRllNfyoVe0M8YwxxFU11cjgzGxBhDyMOGFgJDA0yaFF7CT4VHThHKHIzd2UqQGgkYU1ZIEhHSWtlTlNCLGYbcRVNCA00PVpyIg9bOSVYCBI/CyYgFH9rI1gIDl89R3NvG382XRw5YxEOIRdGWF17TEA=IwdcIw==; tmr_detect=0%7C1738009135866; total_searches=2; device_magritte_breakpoint=m; device_breakpoint=m; __ddg8_=sUXgrdpMVLKrEDPo; __ddg10_=1738009318; gsscgib-w-hh=yLPkofxXtdRfeDlS5xiZjpeJowTXErRnh3kfW08CeZw2TK/hRVxhTd8BG8tUjIpsIoLwkqi5QxKvFTnUYbKBuTpusS2arlSj8cGAC5C5+Qv8MSq+KV76eUDcFFm4TXgyI07B8v+uS9ji85qEUke/RAWp5C9SzJdxAUZ4imLrsnu/doO+IaQ8mS3RW4xy1lRC6IGyCAEm0U5a3zpNKxYyWs/QwUBfP1Z8zuP/XoCCKLs5ssCXDgY42R8IX60YoBJI; cfidsgib-w-hh=I5+1S7ut5hrEhv5G5yD4CRrJU5r56odEMxGEuo3IJgNQxan89p1MSYVEwLhhrzKMvgXU80+/phH5yZMmrKNBS5qaMKfVygFW/EI/K4SVWGCGUxflfVmwcVPbDIe/TYOscywZhitVP5AhlB9Wq2sFk0VXHDm6FhyYC9vXMYo=; cfidsgib-w-hh=I5+1S7ut5hrEhv5G5yD4CRrJU5r56odEMxGEuo3IJgNQxan89p1MSYVEwLhhrzKMvgXU80+/phH5yZMmrKNBS5qaMKfVygFW/EI/K4SVWGCGUxflfVmwcVPbDIe/TYOscywZhitVP5AhlB9Wq2sFk0VXHDm6FhyYC9vXMYo=; gsscgib-w-hh=yLPkofxXtdRfeDlS5xiZjpeJowTXErRnh3kfW08CeZw2TK/hRVxhTd8BG8tUjIpsIoLwkqi5QxKvFTnUYbKBuTpusS2arlSj8cGAC5C5+Qv8MSq+KV76eUDcFFm4TXgyI07B8v+uS9ji85qEUke/RAWp5C9SzJdxAUZ4imLrsnu/doO+IaQ8mS3RW4xy1lRC6IGyCAEm0U5a3zpNKxYyWs/QwUBfP1Z8zuP/XoCCKLs5ssCXDgY42R8IX60YoBJI; fgsscgib-w-hh=l1UXdb2f1505e46dccf6007d676fd57cad165531',
-            'Pragma': 'no-cache',
-            'Priority': 'u=0, i',
-            'Upgrade-Insecure-Requests': '1',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'accept-encoding': 'gzip, deflate, br, zstd',
+            'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'cache-control': 'max-age=0',
+            'cookie': 'hhuid=ntaK0QMGHo3LHWbPaIE0QQ--; _ym_uid=1724868735174098285; _ym_d=1724868735; hhul=0c5a85594ce8b83931d9a664f0a63daa3131d8f2b9245a5a3d4fdd9865770d79; __ddg9_=46.53.254.169; __ddg1_=5dtOtxSK8TY1uEoHj0xH; _xsrf=0e9742f925f82faff2388790c9b25efb; region_fixed=true; display=desktop; cookies_fixed=true; GMT=3; tmr_lvid=b803fd8beea321b83e662e8bd394e6e1; tmr_lvidTS=1724868735057; device_breakpoint=l; _ym_isad=2; _ym_visorc=w; domain_sid=JPS4myBKHvvDhbN7sPWKy%3A1737583788489; iap.uid=c07ba285745b4cc8869192794fe70583; region_clarified=NOT_SET; hhtoken=ZU8mqj_!9INSq7J8wuXdfcZYVlqu; _hi=165052394; hhrole=applicant; regions=""; total_searches=4; device_magritte_breakpoint=l; __zzatgib-w-hh=MDA0dC0jViV+FmELHw4/aQsbSl1pCENQGC9LXy8sPCAdZHlgUnkPVn9WS0V3JVRTPA9jbklteFtBaiBoOVURCxIXRF5cVWl1FRpLSiVueCplJS0xViR8SylEXFAIKiEVeGsnUwkQVy8NPjteLW8PKhMjZHYhP04hC00+KlwVNk0mbjN3RhsJHlksfEspNVZ/elpMGn5yWQsPDRVDc3R3LEBtIV9PXlNEE34KJxkReyVXVQoOYEAzaWVpcC9gIBIlEU1HGEVkW0I2KBVLcU8cenZffSpCaCRkT10gQ1lReykVe0M8YwxxFU11cjgzGxBhDyMOGFgJDA0yaFF7CT4VHThHKHIzd2UqQWodZElcKEdHSWtlTlNCLGYbcRVNCA00PVpyIg9bOSVYCBI/CyYgFH5wK1MIC19BQ3FvG382XRw5YxEOIRdGWF17TEA=v4QRng==; tmr_detect=0%7C1737584106459; gsscgib-w-hh=XsmUBMxC3wL0ugB0gnmnJVNdsDC6oYrlS0w8Q+FMxkjJ5ymQ7IJJ90Nlegjl3iI5BZG38gABXnZGspbpa5TKE1VJdosCeY/aSmRE4mHRtB33zGcQnqzZ/6jtbNUx6gGSmmq7Ahz+eWAvFwyMP5q6fhVJxCj9p+kM4exnwiWuFBic9muPN3+GKsieuEl5P2l1IrfvEZxffNUfippibjI+c0YA3c/lkFJPn6ArBKq0GrIiEFraEtmJgy2H4CeiXL1wgyhfxA==; cfidsgib-w-hh=d6+TJhGlc+mfknq6Fr1u/nYvWqGCRkpxg/b2HMOTnPMMenlD2bAPLxtwb4D+YTgTh3tyZJslCERGDmdHmz5CyQIS+p+9tO+PtQOkVWHOTFSCnxQ4CwyQsc/AUIdNMAuEgMQHtAbWOlGL1hcrG2uCvrB+YkM5fHbwuubbNF0=; cfidsgib-w-hh=d6+TJhGlc+mfknq6Fr1u/nYvWqGCRkpxg/b2HMOTnPMMenlD2bAPLxtwb4D+YTgTh3tyZJslCERGDmdHmz5CyQIS+p+9tO+PtQOkVWHOTFSCnxQ4CwyQsc/AUIdNMAuEgMQHtAbWOlGL1hcrG2uCvrB+YkM5fHbwuubbNF0=; gsscgib-w-hh=XsmUBMxC3wL0ugB0gnmnJVNdsDC6oYrlS0w8Q+FMxkjJ5ymQ7IJJ90Nlegjl3iI5BZG38gABXnZGspbpa5TKE1VJdosCeY/aSmRE4mHRtB33zGcQnqzZ/6jtbNUx6gGSmmq7Ahz+eWAvFwyMP5q6fhVJxCj9p+kM4exnwiWuFBic9muPN3+GKsieuEl5P2l1IrfvEZxffNUfippibjI+c0YA3c/lkFJPn6ArBKq0GrIiEFraEtmJgy2H4CeiXL1wgyhfxA==; __ddg8_=CiYOkheyWEha6Qkg; __ddg10_=1737584730; fgsscgib-w-hh=omAL45eca1bc94a32fb906250db5cb029d94858a',
+            'priority': 'u=0, i',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
         }
     elif index == 2:
         return {
             'Accept': 'application/json',
             'Accept-Encoding': 'gzip, deflate, br, zstd',
-            'Accept-Language': 'ru-RU,ru;q=0.9',
-            'Cookie': 'hhuid=ogfiDIr3fZ9ztGaG9qYxQw--; _ym_uid=1720120998292002741; hhul=0c5a85594ce8b83931d9a664f0a63daa3131d8f2b9245a5a3d4fdd9865770d79; __ddg9_=46.53.254.169; __ddg1_=PBB8Ku4OGTb11nOSn9vU; _xsrf=b03ddeac4e6dc4f6323837eea50619ef; regions=1; region_clarified=NOT_SET; display=desktop; crypted_hhuid=24E9B4391513F61BC00B67F16B210B6407489A407DBA93F151E2EABEE0CF1BE1; GMT=3; tmr_lvid=1d4be8f47da74bb07c5394c3bf12e3be; tmr_lvidTS=1720120998391; _ym_d=1738009083; iap.uid=1cf6bdc1c46f452f8f04401f44134381; _ym_isad=2; _ym_visorc=w; domain_sid=1tIAOBVsSp5njm1l1ThII%3A1738009083999; uxs_uid=2e086ef0-3a3f-11ef-9fbb-99bb2b974093; crypted_id=E0154C375A09DD4F48A21CB2DE4073ABA5471C6F722104504734B32F0D03E9F8; hhtoken=OhVNryfiPApol9anLxkH3v6GAUe8; _hi=153726015; hhrole=applicant; device_magritte_breakpoint=m; device_breakpoint=m; total_searches=1; __zzatgib-w-hh=MDA0dC0jViV+FmELHw4/aQsbSl1pCENQGC9LXy8sPCAdZHlgUnkPVn9WS0V3JVRTPA9jbklteFtBaiBoOVURCxIXRF5cVWl1FRpLSiVueCplJS0xViR8SylEXFAJJRkaeG4nTw0RVy8NPjteLW8PKhMjZHYhP04hC00+KlwVNk0mbjN3RhsJHlksfEspNVZ/elpMGn5yWQsPDRVDc3R3LEBtIV9PXlNEE34KJxkReyVXVQoOYEAzaWVpcC9gIBIlEU1HGEVkW0I2KBVLcU8cenZffSpCaCVfR2IgRllNfyoVe0M8YwxxFU11cjgzGxBhDyMOGFgJDA0yaFF7CT4VHThHKHIzd2UqQGgkYU1ZIEhHSWtlTlNCLGYbcRVNCA00PVpyIg9bOSVYCBI/CyYgFH9rI1gIDl89R3NvG382XRw5YxEOIRdGWF17TEA=IwdcIw==; gsscgib-w-hh=phypfq5vTRHqh7kcovbYsKSC1I5JJwlAWuYiVCtMyEwKrLlgwYUoe4HV0jXJa2w5ieriD1vcUbaUJdLFRDO9RJt7WaGJobtIVJEzEcZXBG/dkYcf5txGtV9u2c1wsGExu+ORaizvMjoqysIt0Bexyl5oHpCCkAe1TIhh8Kw3DeTLFPBx172z0WFqGTga2XYU0zvcEdGXE4igthKLV039/ikTL+NRQxTN1O4e7b3D/Y5gGjJ0kKW2nLQax5lfFB0u; cfidsgib-w-hh=mKzPX7Dz8Ps6MNPUoxALPjvcpE2jPhb8aicqkPP4KfK5tdLEat9KAQEQpwedgt5J2fMVVS9KSKnymOp5/qDbvxyO2YrhQWVrxGyBQeZA5jXNelbET05GWp0+fFnZK9PkMSaUhlpXH3r2gSolfpXApdbfNmWhWVN18Nf/chU=; cfidsgib-w-hh=mKzPX7Dz8Ps6MNPUoxALPjvcpE2jPhb8aicqkPP4KfK5tdLEat9KAQEQpwedgt5J2fMVVS9KSKnymOp5/qDbvxyO2YrhQWVrxGyBQeZA5jXNelbET05GWp0+fFnZK9PkMSaUhlpXH3r2gSolfpXApdbfNmWhWVN18Nf/chU=; gsscgib-w-hh=phypfq5vTRHqh7kcovbYsKSC1I5JJwlAWuYiVCtMyEwKrLlgwYUoe4HV0jXJa2w5ieriD1vcUbaUJdLFRDO9RJt7WaGJobtIVJEzEcZXBG/dkYcf5txGtV9u2c1wsGExu+ORaizvMjoqysIt0Bexyl5oHpCCkAe1TIhh8Kw3DeTLFPBx172z0WFqGTga2XYU0zvcEdGXE4igthKLV039/ikTL+NRQxTN1O4e7b3D/Y5gGjJ0kKW2nLQax5lfFB0u; tmr_detect=0%7C1738009135866; __ddg10_=1738009141; __ddg8_=sBhjrAYo9kwZJ2KL; fgsscgib-w-hh=ek8Pf947b75878233f824329df096619b158b0a5',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Cookie': 'hhuid=ntaK0QMGHo3LHWbPaIE0QQ--; _ym_uid=1724868735174098285; _ym_d=1724868735; hhul=0c5a85594ce8b83931d9a664f0a63daa3131d8f2b9245a5a3d4fdd9865770d79; __ddg9_=46.53.254.169; __ddg1_=5dtOtxSK8TY1uEoHj0xH; _xsrf=0e9742f925f82faff2388790c9b25efb; region_fixed=true; display=desktop; cookies_fixed=true; GMT=3; tmr_lvid=b803fd8beea321b83e662e8bd394e6e1; tmr_lvidTS=1724868735057; device_breakpoint=l; _ym_isad=2; _ym_visorc=w; domain_sid=JPS4myBKHvvDhbN7sPWKy%3A1737583788489; iap.uid=c07ba285745b4cc8869192794fe70583; region_clarified=NOT_SET; hhtoken=ZU8mqj_!9INSq7J8wuXdfcZYVlqu; _hi=165052394; hhrole=applicant; regions=""; total_searches=7; device_magritte_breakpoint=xxl; __zzatgib-w-hh=MDA0dC0jViV+FmELHw4/aQsbSl1pCENQGC9LXy8sPCAdZHlgUnkPVn9WS0V3JVRTPA9jbklteFtBaiBoOVURCxIXRF5cVWl1FRpLSiVueCplJS0xViR8SylEXFAIKiEVf2wkVQ0TVy8NPjteLW8PKhMjZHYhP04hC00+KlwVNk0mbjN3RhsJHlksfEspNVZ/elpMGn5yWQsPDRVDc3R3LEBtIV9PXlNEE34KJxkReyVXVQoOYEAzaWVpcC9gIBIlEU1HGEVkW0I2KBVLcU8cenZffSpCaCRkT10nRFZTfy0Ve0M8YwxxFU11cjgzGxBhDyMOGFgJDA0yaFF7CT4VHThHKHIzd2UqQWodZElcKEdHSWtlTlNCLGYbcRVNCA00PVpyIg9bOSVYCBI/CyYgFH5wK1MPDFxDR3VvG382XRw5YxEOIRdGWF17TEA=lIpfag==; gsscgib-w-hh=vJXY0T8dsXPhUuNs+dsle3UiTC/id/n6aZBaVn2es3C77vnkACDLkHodxKwOC42wiHTnvvoF1JM9ttaHPEBsIFcDgBaFl4XHRrip5gToisLAdNrcxKbjT/31zQppvm0NTxs0GAak7M39TnhYYN0g2uQTtv3mBHkgmn7tQOq3gEOAWdgoiOCd1h6fgBEwN5EPpKy8rhr8nJXbde2Yyb4U2p4E7Tqh3fXUzSCEZQ8IH78pHeh1lVWIqh9+o8dTVIdk8BRzAw==; cfidsgib-w-hh=HdE8QLL90E8IZVF+gxRkwEojnmw9Q0R/jTL+7lavhkDtMLHqKWgzazaJqm63LBumwqB5crM9VoOoC73y82S4FvpJN0ZCeCWC+NB7kY906qH6yFaj4iK1ir51nQz+SL/6nI9qbDbqVDFcddgLygEzLLNfwBUBJgpou9cKUyw=; cfidsgib-w-hh=HdE8QLL90E8IZVF+gxRkwEojnmw9Q0R/jTL+7lavhkDtMLHqKWgzazaJqm63LBumwqB5crM9VoOoC73y82S4FvpJN0ZCeCWC+NB7kY906qH6yFaj4iK1ir51nQz+SL/6nI9qbDbqVDFcddgLygEzLLNfwBUBJgpou9cKUyw=; gsscgib-w-hh=vJXY0T8dsXPhUuNs+dsle3UiTC/id/n6aZBaVn2es3C77vnkACDLkHodxKwOC42wiHTnvvoF1JM9ttaHPEBsIFcDgBaFl4XHRrip5gToisLAdNrcxKbjT/31zQppvm0NTxs0GAak7M39TnhYYN0g2uQTtv3mBHkgmn7tQOq3gEOAWdgoiOCd1h6fgBEwN5EPpKy8rhr8nJXbde2Yyb4U2p4E7Tqh3fXUzSCEZQ8IH78pHeh1lVWIqh9+o8dTVIdk8BRzAw==; tmr_detect=0%7C1737584813763; __ddg10_=1737584819; __ddg8_=2oq6wltAynqdKAYf; fgsscgib-w-hh=IBg2b7b2dabd5d059d6eb682016a8d0e36eacad2',
             'Priority': 'u=1, i',
-            'Referer': 'https://hh.ru/search/vacancy?area=1&ored_clusters=true&order_by=publication_time',
+            'Referer': 'https://zarplata.ru/search/vacancy?area=1&ored_clusters=true&order_by=publication_time',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            'X-Gib-Fgsscgib-W-Hh': 'Rjy61c74afefb375c1d175d837fc688f98f0b11a',
-            'X-Gib-Gsscgib-W-Hh': 'MNyFQ5W1z0UErlzo1/SgaIsjXVYMpR8OzUeoUJsPtn9yHaxeib4JwZLlUvwzK0/cvhuT3QegDEwfsCyaSlR9rn1XNdoIBbB2FssEnYrqqIZlab41sGOOmCv85PgTIss0t7qLiykvMyIc7ypcKWfzmvhahOIWieGqtF+AOiDr9A7U1LCNcWRvwG40ljfcISeoYslRAfKE60SJFJ268JqLVj+2DsO4MGWWXQ03TtrfdAdfFYWZDuW+i6MdDln/WZOL8w==',
-            'X-Hhtmfrom': 'vacancy_search_filter',
-            'X-Hhtmfromlabel': 'X-Hhtmsource',
-            'X-Requested-With': 'XMLHttpRequest',
-            'X-Static-Version': VERSION,
-            'X-Xsrftoken': '696f6f77c6fd5206279bf310a9ed9a47'
+            'X-Gib-Fgsscgib-W-Hh': 'oJgF28b56942c2e49214a02c85526f41ad8e4e03',
+            'X-Gib-Gsscgib-W-Hh': 'DJQJqS+Sg7vmxz+/iAfWrGKBiP/htwBWXhS+rLIhRx1cfbtrTUtjuBLX5GvrWe4IYAVdNEJlhs3oLUwhVIuJoodF0vfEdlniVCsV77IWx2n8Wc/0SBnrsmoDgBeR09OHyfwAGnSA3jQ0nqkLfMIiso1JbnyD2CUtdzKmAfKvgfxYiESLkKbwtHivqbi8/4FGxOy21BX3LwUufzMW5sA/smnTUO26B6YCqAod969zjpaHEdEqC4N1wZUDrCC57g==',
+            'x-hhtmfrom': 'vacancy_search_filter',
+            'x-hhtmfromlabel': '',
+            'x-hhtmsource': '',
+            'x-requested-with': 'XMLHttpRequest',
+            'x-static-version': VERSION,
+            'x-xsrftoken': '0e9742f925f82faff2388790c9b25efb'
         }
     else:
         return {
-            'Accept': 'application/json',
-            'Accept-Encoding': 'gzip, deflate, br, zstd',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Cookie': 'hhuid=ogfiDIr3fZ9ztGaG9qYxQw--; _ym_uid=1720120998292002741; hhul=0c5a85594ce8b83931d9a664f0a63daa3131d8f2b9245a5a3d4fdd9865770d79; __ddg1_=PBB8Ku4OGTb11nOSn9vU; _xsrf=b03ddeac4e6dc4f6323837eea50619ef; region_clarified=NOT_SET; display=desktop; crypted_hhuid=24E9B4391513F61BC00B67F16B210B6407489A407DBA93F151E2EABEE0CF1BE1; GMT=3; tmr_lvid=1d4be8f47da74bb07c5394c3bf12e3be; tmr_lvidTS=1720120998391; _ym_d=1738009083; iap.uid=1cf6bdc1c46f452f8f04401f44134381; uxs_uid=2e086ef0-3a3f-11ef-9fbb-99bb2b974093; total_searches=3; regions=1; __ddg9_=46.53.254.169; _ym_isad=2; _ym_visorc=w; domain_sid=1tIAOBVsSp5njm1l1ThII%3A1738320950724; remember=0; lrp=""; lrr=""; crypted_id=E0154C375A09DD4F48A21CB2DE4073ABA5471C6F722104504734B32F0D03E9F8; hhtoken=Mszg_Vy1pTdi1!hgeNUFQQ!h0lwB; _hi=153726015; hhrole=applicant; device_breakpoint=l; tmr_detect=0%7C1738320992498; device_magritte_breakpoint=xxl; __zzatgib-w-hh=MDA0dC0jViV+FmELHw4/aQsbSl1pCENQGC9LXzFabmVPGElfUEpVVXosShh3J1lUCg8WQkgmeV8+ak8aOVURCxIXRF5cVWl1FRpLSiVueCplJS0xViR8SylEXFAJKBsSd2wrTw4MVy8NPjteLW8PKhMjZHYhP04hC00+KlwVNk0mbjN3RhsJHlksfEspNVZ/elpMGn5yWQsPDRVDc3R3LEBtIV9PXlNEE34KJxkReyVXVQoOYEAzaWVpcC9gIBIlEU1HGEVkW0I2KBVLcU8cenZffSpCaCViSVofRF1Nfy4Ve0M8YwxxFU11cjgzGxBhDyMOGFgJDA0yaFF7CT4VHThHKHIzd2UqQGgkYU1ZIEhHSWtlTlNCLGYbcRVNCA00PVpyIg9bOSVYCBI/CyYgFH9uJVB/DGM9SG1vG382XRw5YxEOIRdGWF17TEA=WmY/8g==; __ddg8_=LfS8okKWQCU7rtuZ; __ddg10_=1738321019; gsscgib-w-hh=0d25eVRBo+7+tp482DKi/jFFCW2VDHC+vNcQONDrfQvNwCGDvYdQiH23JOwLEtfCs2YmZciLIUf5rs55TajCc8BTbNj8rlwqprqct/n6DcHXG46KGlDmrTuAI/gYCAwHMxeWEyl4Nc37lI3LO2H2e+yc10jPy/TR6XNvlrCeN+bVQHKZC47omccURb3AXGybpWAy8OlUizH+f5WnJL3TKv/jFlrBJFKOXh5F6FH1093fJvPmi8DM15hpcQHQV5z1iV6Wf0+cnb9SGrV0; cfidsgib-w-hh=ZU2ycCedw3d/SSvxSGe2icYwEjsw2JAN2L6YzDnnUrn/DvHD6+71GXxBtzTjJGdb8I2+EPbFnRub0RRmgny6UHiHk7e3JNGcP+AvABkPVEeVa2220pb2bBQGY4msN3xNc2wiP1llPKwU2mVGLfooYeAGuS+cVzwUa03uOA8=; cfidsgib-w-hh=ZU2ycCedw3d/SSvxSGe2icYwEjsw2JAN2L6YzDnnUrn/DvHD6+71GXxBtzTjJGdb8I2+EPbFnRub0RRmgny6UHiHk7e3JNGcP+AvABkPVEeVa2220pb2bBQGY4msN3xNc2wiP1llPKwU2mVGLfooYeAGuS+cVzwUa03uOA8=; gsscgib-w-hh=0d25eVRBo+7+tp482DKi/jFFCW2VDHC+vNcQONDrfQvNwCGDvYdQiH23JOwLEtfCs2YmZciLIUf5rs55TajCc8BTbNj8rlwqprqct/n6DcHXG46KGlDmrTuAI/gYCAwHMxeWEyl4Nc37lI3LO2H2e+yc10jPy/TR6XNvlrCeN+bVQHKZC47omccURb3AXGybpWAy8OlUizH+f5WnJL3TKv/jFlrBJFKOXh5F6FH1093fJvPmi8DM15hpcQHQV5z1iV6Wf0+cnb9SGrV0; fgsscgib-w-hh=jlLX539f277e0f28993e245fb0249be9589d8879',
-            'Priority': 'u=1, i',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            'X-Gib-Fgsscgib-W-Hh': 'jlLX539f277e0f28993e245fb0249be9589d8879',
-            'X-Gib-Gsscgib-W-Hh': '0d25eVRBo+7+tp482DKi/jFFCW2VDHC+vNcQONDrfQvNwCGDvYdQiH23JOwLEtfCs2YmZciLIUf5rs55TajCc8BTbNj8rlwqprqct/n6DcHXG46KGlDmrTuAI/gYCAwHMxeWEyl4Nc37lI3LO2H2e+yc10jPy/TR6XNvlrCeN+bVQHKZC47omccURb3AXGybpWAy8OlUizH+f5WnJL3TKv/jFlrBJFKOXh5F6FH1093fJvPmi8DM15hpcQHQV5z1iV6Wf0+cnb9SGrV0',
-            'X-Hhtmfrom': 'vacancy_search_filter',
-            'X-Hhtmsource': 'vacancy_search_list',
-            'X-Requested-With': 'XMLHttpRequest',
-            'X-Xsrftoken': 'b03ddeac4e6dc4f6323837eea50619ef'
+            'accept': 'application/json',
+            'accept-encoding': 'gzip, deflate, br, zstd',
+            'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'cookie': 'hhuid=bMaR!9gV28UssmZG7cJIPA--; _ym_uid=1715924420411221156; __ddg9_=178.163.234.194; __ddg1_=Hq8eEBIhh6e7gaFofd41; _xsrf=777a5775fe3751d4b4b30c13262f9336; region_clarified=NOT_SET; display=desktop; crypted_hhuid=813B8CFACF7ED8634BE5732E12B2E2F317B14B13927948FC53B6026F90D9F0F3; GMT=3; tmr_lvid=b0976968745b884bbeb8387478f4b2f2; tmr_lvidTS=1715924420161; _ym_d=1738589643; iap.uid=477b1b31ff6b4ef2837919e3efb269bc; _ym_isad=2; domain_sid=h1KwW3aaWSi8mkBTXJH8m%3A1738589644963; uxs_uid=13377d80-39f1-11ef-9203-5dcd566bfe66; crypted_id=E0154C375A09DD4F48A21CB2DE4073ABA5471C6F722104504734B32F0D03E9F8; hhul=0c5a85594ce8b83931d9a664f0a63daa3131d8f2b9245a5a3d4fdd9865770d79; hhtoken=QDg9K9vezGQyhC8Mxl4Gc1mwTgOg; _hi=153726015; hhrole=applicant; regions=6577; total_searches=1; _ym_visorc=w; device_magritte_breakpoint=l; device_breakpoint=l; __zzatgib-w-hh=MDA0dC0jViV+FmELHw4/aQsbSl1pCENQGC9LX3haQB4dZElgIUNaCAomHBV5bClPEDwVREd0el4/HiMbOVURCxIXRF5cVWl1FRpLSiVueCplJS0xViR8SylEXFAJKxoUfHAqUn8RVy8NPjteLW8PKhMjZHYhP04hC00+KlwVNk0mbjN3RhsJHlksfEspNVZ/elpMGn5yWQsPDRVDc3R3LEBtIV9PXlNEE34KJxkReyVXVQoOYEAzaWVpcC9gIBIlEU1HGEVkW0I2KBVLcU8cenZffSpCaCVlSFwkSFxQeSgVe0M8YwxxFU11cjgzGxBhDyMOGFgJDA0yaFF7CT4VHThHKHIzd2UqQGgkYU1ZIEhHSWtlTlNCLGYbcRVNCA00PVpyIg9bOSVYCBI/CyYgFH9xJFIMEGJAQXJvG382XRw5YxEOIRdGWF17TEA=EUD52g==; gsscgib-w-hh=kOZ0t4t9tH+69lolotz6M9Irh6NCPwn9OyYI1CIF/uODYHVSoSmcLV33jIpEYxrhME5/cDTka83vNlGadArHLDZvX7o+uLVQtJyZ9hH8+Or+yCAOVZTgskMRXAnncT6TUpSybIm6AVsjfMQk4NBUR4KeB/TXWCh9fW6Cb/gaoRWQtRjaeIHSZxKGomfj5/QNuBk7ke9bgeK8zdjMQMk1M8VaQHFjT3a8DMknhZYX3L3jJ4ZR0j0Aqv/JIrvXM2GDICxpfQY/J86S; cfidsgib-w-hh=M8+DcZW7HZbA7NaAf3mPPh2RaQtMy5AQVS8rRwP/Cjria+oWK3H/7SBp/0HMRF7LIdLrwMfKHUuFc88dUojDD9oduAP350tDJPJz2PA3SpPsQirpfM6xgn+fwmi2jTqHJX36ma+UmbN82c6HfH7CdUpLFvBhzLymjaiRsYY=; cfidsgib-w-hh=M8+DcZW7HZbA7NaAf3mPPh2RaQtMy5AQVS8rRwP/Cjria+oWK3H/7SBp/0HMRF7LIdLrwMfKHUuFc88dUojDD9oduAP350tDJPJz2PA3SpPsQirpfM6xgn+fwmi2jTqHJX36ma+UmbN82c6HfH7CdUpLFvBhzLymjaiRsYY=; gsscgib-w-hh=kOZ0t4t9tH+69lolotz6M9Irh6NCPwn9OyYI1CIF/uODYHVSoSmcLV33jIpEYxrhME5/cDTka83vNlGadArHLDZvX7o+uLVQtJyZ9hH8+Or+yCAOVZTgskMRXAnncT6TUpSybIm6AVsjfMQk4NBUR4KeB/TXWCh9fW6Cb/gaoRWQtRjaeIHSZxKGomfj5/QNuBk7ke9bgeK8zdjMQMk1M8VaQHFjT3a8DMknhZYX3L3jJ4ZR0j0Aqv/JIrvXM2GDICxpfQY/J86S; tmr_detect=0%7C1738613558757; __ddg10_=1738613559; __ddg8_=ULNC2mU2dffhdm0W; fgsscgib-w-hh=FSG7481b17e4dbe258d817e8b4abebe220842eaf',
+            'priority': 'u=1, i',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            'x-gib-fgsscgib-w-hh': 'GpC670cc8ca4c0c0bcf222838cdfc87ec4bbae99',
+            'x-gib-gsscgib-w-hh': '2pCJjkfUGke0G8u2S4wt2YVdJRPcO7PlqyEM1XtTDuJxaqsKA3DFpC3MR2W+QnD3+nZQ5Szlz/1dYsSD3PTI7PgoFQZHjUsW2KiDa+hwZ3m87/ACaiBgacanz+QO8P1d4ILFyPQ9+cTOOjKY0hmEnmRFllahNjZZ4yWtBvc8C9gGjfpn7Wg35ImuxyaKrj7rFFG19UAQVAOuj3Ez/OEFTpzXsPXKFlO2bUE4dnqx15BxOHt2oXmdKUYhZr0sDuiB+AxEdA==',
+            'x-hhtmfrom': 'vacancy_search_filter',
+            'x-hhtmsource': 'vacancy_search_list',
+            'x-requested-with': 'XMLHttpRequest',
+            'x-xsrftoken': '0e9742f925f82faff2388790c9b25efb'
         }
+
+
+def format_setting() -> tuple[str, list[str], list[str]]:
+    settings = get_settings()
+    for parser in settings.get('parsers', list()):
+        if parser.get('name') == 'hh.ru':
+            areas = parser.get('structure', dict()).get('areas', list())
+            roles = parser.get('structure', dict()).get('roles', list())
+            for sort_type, value in parser.get('structure', dict()).get('sorted', dict()).items():
+                if value:
+                    return sort_type, areas, roles
+            else:
+                return 'relevance', areas, roles
+    else:
+        raise ValueError('Не найдены настройки для текущего парсера')
+
+
+def get_settings() -> dict:
+    filename = r'./SearchSettings.json'
+    if os.path.exists(filename):
+        with open(file=filename, mode='r') as file:
+            return json.load(file)
+    else:
+        raise FileNotFoundError('Файл с настройками не найден')
 
 
 async def get_file_vacancies() -> set:
@@ -208,7 +235,7 @@ async def send_webhook(url: str, data: dict) -> bool:
 
 
 async def parse_status() -> str:
-    async with ClientSession(headers=await get_headers(index=1), connector=TCPConnector(ssl=False)) as session:
+    async with ClientSession(headers=get_headers(index=1), connector=TCPConnector(ssl=False)) as session:
         while True:
             try:
                 async with session.get(
@@ -243,9 +270,9 @@ async def parse_contacts(session: ClientSession, vacancy_id: int, employer_id: i
             await asyncio.sleep(30)
 
 
-async def parse_region_page(area_id: str, role_id: str, page: int) -> dict:
+async def parse_region_page(area_id: str, role_id: str, page: int, sort_type: str) -> dict:
     while True:
-        async with ClientSession(headers=await get_headers(index=2), connector=TCPConnector(ssl=False)) as session:
+        async with ClientSession(headers=get_headers(index=2), connector=TCPConnector(ssl=False)) as session:
             try:
                 async with session.get(
                         url='https://hh.ru/search/vacancy?'
@@ -257,7 +284,7 @@ async def parse_region_page(area_id: str, role_id: str, page: int) -> dict:
                         'salary=&'
                         'currency_code=RUR&'
                         'experience=doesNotMatter&'
-                        'order_by=publication_time&'
+                        f'order_by={sort_type}&'
                         'search_period=0&'
                         'items_on_page=100&'
                         f'page={page}&'

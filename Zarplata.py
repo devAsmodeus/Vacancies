@@ -15,14 +15,14 @@ VERSION = '24.35.6'
 
 async def main() -> None:
     while True:
-        menu = await format_details()
+        menu, sort_type = await format_details()
         for region, city_id, city_name, role_id, role_name in set(menu):
             file_vacancies, new_vacancies = await get_file_vacancies(), set()
             print(f'На данный момент в хранилище {len(file_vacancies)} вакансий')
             try:
                 for page in count(start=0, step=1):
                     print(f'Парсим вакансии: {region} / {city_name} / {role_name}. Страница {page + 1}')
-                    page_vacancies = await parse_region_page(city_id, role_id, page)
+                    page_vacancies = await parse_region_page(city_id, role_id, page, sort_type)
                     new_vacancies = await send_vacancies(
                         vacancies=dict.get(page_vacancies, 'vacancies'),
                         file_vacancies=file_vacancies,
@@ -41,34 +41,39 @@ async def main() -> None:
                 await asyncio.sleep(120)
 
 
-async def format_details() -> list[tuple]:
-    async with ClientSession(headers=await get_headers(index=1), connector=TCPConnector(ssl=False)) as session:
-        menu, urls = await parse_menu(session), list()
-        menu = json.loads(menu.find(id='HH-Lux-InitialState').text)
-        area, industries, roles = menu['areaTree'], menu['industriesTree'], menu['professionalRoleTree']
-        for region in area:
-            region_id, region_name = dict.get(region, 'id'), dict.get(region, 'text')
-            for city in dict.get(region, 'items', dict()):
-                city_id, city_name = dict.get(city, 'id'), dict.get(city, 'text')
-                urls.extend(await format_roles(roles, region_name, city_id, city_name))
+async def format_details() -> tuple[list[tuple], str]:
+    headers, connector = get_headers(index=1), TCPConnector(ssl=False)
+    result, (sort_type, settings_areas, settings_roles) = list(), format_setting()
+    async with ClientSession(headers=headers, connector=connector) as session:
+        menu: BeautifulSoup = await parse_menu(session)
+        menu: dict = json.loads(menu.find(id='HH-Lux-InitialState').text)
+        areas, roles = menu.get('areaTree', list()), menu.get('professionalRoleTree', dict())
+        for area in areas:
+            area_id, area_name = area.get('id'), area.get('text')
+            for city in area.get('items', dict()):
+                city_id, city_name = city.get('id'), city.get('text')
+                parameters = area_name, city_id, city_name
+                result.extend(format_roles(roles, settings_areas, settings_roles, parameters))
             else:
-                urls.extend(await format_roles(roles, region_name, region_id, region_name))
+                parameters = area_name, area_id, area_name
+                result.extend(format_roles(roles, settings_areas, settings_roles, parameters))
         else:
-            return urls
+            return result, sort_type
 
 
-async def format_roles(roles, region, city_id, city_name):
-    urls = list()
-    for part_roles in dict.get(roles, 'items', dict()):
-        for role in dict.get(part_roles, 'items', dict()):
-            role_id, role_name = dict.get(role, 'id'), dict.get(role, 'text')
-            urls.append((region, city_id, city_name, role_id, role_name))
+def format_roles(roles: dict, settings_areas: list[str], settings_roles: list[str], *args) -> list[tuple]:
+    result, (region, area_id, area_name) = list(), *args
+    for part_roles in roles.get('items', dict()):
+        for role in part_roles.get('items', dict()):
+            role_id, role_name = role.get('id'), role.get('text')
+            if role_id in settings_roles and area_id in settings_areas:
+                result.append((region, area_id, area_name, role_id, role_name))
     else:
-        return urls
+        return result
 
 
 async def send_vacancies(vacancies: list[dict], file_vacancies: set, new_vacancies: set) -> set:
-    async with ClientSession(headers=await get_headers(index=3), connector=TCPConnector(ssl=False)) as session:
+    async with ClientSession(headers=get_headers(index=3), connector=TCPConnector(ssl=False)) as session:
         for vacancy in tqdm(vacancies, desc='Отправка вакансий по запросу'):
             vacancy_id = dict.get(vacancy, 'vacancyId')
             if vacancy_id not in file_vacancies and vacancy_id not in new_vacancies and '@isAdv' not in vacancy:
@@ -108,15 +113,6 @@ async def format_vacancy(vacancy: dict, contacts: dict, index: int) -> tuple[str
         }
     else:
         url = 'https://c6ce863bb1eb.vps.myjino.ru/contacts?apiKey=Wy7RXAzSRZpD4a3q'
-        print((
-                f"{dict.get(vacancy, 'name')};"
-                f"{vacancy.get('company', dict()).get('name')};"
-                f"{dict.get(vacancy, 'links', dict()).get('desktop')};"
-                f"{dict.get(contacts, 'fio')};"
-                f"{dict.get(contacts, 'email')};"
-                f"{phone};"
-                f"{dict.get(vacancy, 'area', dict()).get('name')}"
-            ))
         return url, {
             'vacancy_name': vacancy.get('name'),
             'city': vacancy.get('area', dict()).get('name'),
@@ -136,7 +132,7 @@ async def format_vacancy(vacancy: dict, contacts: dict, index: int) -> tuple[str
         }
 
 
-async def get_headers(index: int) -> dict:
+def get_headers(index: int) -> dict:
     if index == 1:
         return {
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -182,6 +178,30 @@ async def get_headers(index: int) -> dict:
         }
 
 
+def format_setting() -> tuple[str, list[str], list[str]]:
+    settings = get_settings()
+    for parser in settings.get('parsers', list()):
+        if parser.get('name') == 'zarplata.ru':
+            areas = parser.get('structure', dict()).get('areas', list())
+            roles = parser.get('structure', dict()).get('roles', list())
+            for sort_type, value in parser.get('structure', dict()).get('sorted', dict()).items():
+                if value:
+                    return sort_type, areas, roles
+            else:
+                return 'relevance', areas, roles
+    else:
+        raise ValueError('Не найдены настройки для текущего парсера')
+
+
+def get_settings() -> dict:
+    filename = r'./SearchSettings.json'
+    if os.path.exists(filename):
+        with open(file=filename, mode='r') as file:
+            return json.load(file)
+    else:
+        raise FileNotFoundError('Файл с настройками не найден')
+
+
 async def get_file_vacancies() -> set:
     filename, vacancies = r'./VacanciesZarplataRU.json', set()
     if os.path.exists(filename):
@@ -209,7 +229,7 @@ async def send_webhook(url: str, data: dict) -> bool:
 
 
 async def parse_status() -> str:
-    async with ClientSession(headers=await get_headers(index=1), connector=TCPConnector(ssl=False)) as session:
+    async with ClientSession(headers=get_headers(index=1), connector=TCPConnector(ssl=False)) as session:
         while True:
             try:
                 async with session.get(
@@ -244,9 +264,9 @@ async def parse_contacts(session: ClientSession, vacancy_id: int, employer_id: i
             await asyncio.sleep(30)
 
 
-async def parse_region_page(area_id: str, role_id: str, page: int) -> dict:
+async def parse_region_page(area_id: str, role_id: str, page: int, sort_type: str) -> dict:
     while True:
-        async with ClientSession(headers=await get_headers(index=2), connector=TCPConnector(ssl=False)) as session:
+        async with ClientSession(headers=get_headers(index=2), connector=TCPConnector(ssl=False)) as session:
             try:
                 async with session.get(
                         url='https://zarplata.ru/search/vacancy?'
@@ -258,7 +278,7 @@ async def parse_region_page(area_id: str, role_id: str, page: int) -> dict:
                         'salary=&'
                         'currency_code=RUR&'
                         'experience=doesNotMatter&'
-                        'order_by=publication_time&'
+                        f'order_by={sort_type}&'
                         'search_period=0&'
                         'items_on_page=100&'
                         f'page={page}&'
