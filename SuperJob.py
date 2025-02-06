@@ -177,7 +177,7 @@ async def get_headers(index: int) -> dict:
             'x-hhtmfromlabel': '',
             'x-hhtmsource': '',
             'x-requested-with': 'XMLHttpRequest',
-            'x-static-version': VERSION,
+            'x-static-version': '',
             'x-xsrftoken': '0e9742f925f82faff2388790c9b25efb'
         }
     else:
